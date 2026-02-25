@@ -67,3 +67,44 @@ class Product(models.Model):
             raise ValueError(f"Not enough stock: {self.stock_quantity} available")
         self.stock_quantity -= quantity
         self.save(update_fields=['stock_quantity'])
+
+# core/models.py (add after Order/OrderItem)
+
+class Cart(models.Model):
+    """
+    Shopping cart for customers
+    """
+    customer = models.OneToOneField(
+        UserProfile,
+        on_delete=models.CASCADE,
+        limit_choices_to={'role': 'customer'},
+        related_name='cart'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"Cart for {self.customer.username}"
+
+    def total_items(self):
+        return self.items.count()
+
+    def total_price(self):
+        return sum(item.subtotal for item in self.items.all())
+
+
+class CartItem(models.Model):
+    cart = models.ForeignKey(Cart, on_delete=models.CASCADE, related_name='items')
+    product = models.ForeignKey(Product, on_delete=models.CASCADE)
+    quantity = models.PositiveIntegerField(default=1)
+    added_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ('cart', 'product')  # one product per cart
+
+    def __str__(self):
+        return f"{self.quantity} × {self.product.name}"
+
+    @property
+    def subtotal(self):
+        return self.quantity * self.product.price

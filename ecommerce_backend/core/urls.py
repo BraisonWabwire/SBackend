@@ -1,7 +1,7 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import RegisterView, LoginView
-from .views import AddProductView
+from .views import AddProductView,ProductListView,AddToCartView,CartView,RemoveCartItemView
 
 router = DefaultRouter()
 
@@ -15,4 +15,11 @@ urlpatterns = [
     # Optional: built-in token obtain (you can keep or remove)
     # path('auth/token/', obtain_auth_token, name='api_token_auth'),
     path('products/add/', AddProductView.as_view(), name='add-product'),
+    path('products/', ProductListView.as_view(), name='product-list'),
+
+
+    # Cart item
+    path('cart/add/', AddToCartView.as_view(), name='add-to-cart'),
+    path('cart/', CartView.as_view(), name='cart-detail'),
+    path('cart/items/<int:pk>/', RemoveCartItemView.as_view(), name='remove-cart-item'),
 ]

@@ -109,3 +109,98 @@ class AddProductView(APIView):
             )
 
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+from rest_framework import generics
+from rest_framework.permissions import AllowAny   # or IsAuthenticated if you want only logged-in users
+from .models import Product
+from .serializers import ProductSerializer
+
+
+class ProductListView(generics.ListAPIView):
+    """
+    GET /api/products/
+    Returns list of all products (public or filtered later)
+    """
+    queryset = Product.objects.filter(is_available=True)
+    serializer_class = ProductSerializer
+    permission_classes = [AllowAny]  # change to IsAuthenticated if needed
+
+
+from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from .models import Cart, CartItem, Product, UserProfile
+from .serializers import CartSerializer, CartItemSerializer
+
+
+class AddToCartView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        try:
+            profile = request.user.userprofile
+            if profile.role != 'customer':
+                return Response({"detail": "Only customers can add to cart"}, status=403)
+        except UserProfile.DoesNotExist:
+            return Response({"detail": "Profile not found"}, status=400)
+
+        product_id = request.data.get('product_id')
+        quantity = request.data.get('quantity', 1)
+
+        if not product_id:
+            return Response({"detail": "product_id is required"}, status=400)
+
+        try:
+            product = Product.objects.get(id=product_id)
+        except Product.DoesNotExist:
+            return Response({"detail": "Product not found"}, status=404)
+
+        # Get or create cart
+        cart, created = Cart.objects.get_or_create(customer=profile)
+
+        # Check if item already in cart
+        cart_item, created = CartItem.objects.get_or_create(
+            cart=cart,
+            product=product,
+            defaults={'quantity': quantity}
+        )
+
+        if not created:
+            cart_item.quantity += int(quantity)
+            cart_item.save()
+
+        return Response(
+            {"message": "Added to cart", "cart": CartSerializer(cart).data},
+            status=status.HTTP_201_CREATED
+        )
+
+
+class CartView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        try:
+            cart = Cart.objects.get(customer=request.user.userprofile)
+            return Response(CartSerializer(cart).data)
+        except Cart.DoesNotExist:
+            return Response({"items": [], "total_items": 0, "total_price": "0.00"})
+
+class RemoveCartItemView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request, pk):
+        try:
+            profile = request.user.userprofile
+            if profile.role != 'customer':
+                return Response({"detail": "Only customers can modify cart"}, status=403)
+        except UserProfile.DoesNotExist:
+            return Response({"detail": "Profile not found"}, status=400)
+
+        try:
+            cart_item = CartItem.objects.get(id=pk, cart__customer=profile)
+            cart_item.delete()
+            return Response({"message": "Item removed from cart"}, status=status.HTTP_204_NO_CONTENT)
+        except CartItem.DoesNotExist:
+            return Response({"detail": "Cart item not found or does not belong to you"}, status=404)
