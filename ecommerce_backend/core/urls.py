@@ -1,25 +1,38 @@
+# core/urls.py
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from .views import RegisterView, LoginView
-from .views import AddProductView,ProductListView,AddToCartView,CartView,RemoveCartItemView
 
+# Import all your views
+from .views import (
+    RegisterView,
+    LoginView,
+    ProductViewSet,          # ← use ViewSet instead of separate list/add
+    AddToCartView,
+    CartView,
+    RemoveCartItemView,
+    # UpdateCartItemView,      # optional – for quantity update
+)
+
+# Create router
 router = DefaultRouter()
 
+# Register ViewSets (automatic CRUD endpoints)
+router.register(r'products', ProductViewSet, basename='product')
+
+# Manual paths for non-standard views
 urlpatterns = [
-    path('', include(router.urls)),
-
-    # Auth endpoints
+    # Auth (custom views, not ViewSets)
     path('auth/register/', RegisterView.as_view(), name='register'),
-    path('auth/login/',    LoginView.as_view(),    name='login'),
+    path('auth/login/', LoginView.as_view(), name='login'),
 
-    # Optional: built-in token obtain (you can keep or remove)
-    # path('auth/token/', obtain_auth_token, name='api_token_auth'),
-    path('products/add/', AddProductView.as_view(), name='add-product'),
-    path('products/', ProductListView.as_view(), name='product-list'),
-
-
-    # Cart item
+    # Cart (custom actions)
     path('cart/add/', AddToCartView.as_view(), name='add-to-cart'),
     path('cart/', CartView.as_view(), name='cart-detail'),
     path('cart/items/<int:pk>/', RemoveCartItemView.as_view(), name='remove-cart-item'),
+    
+    # Optional: if you add PATCH for quantity update
+    # path('cart/items/<int:pk>/update/', UpdateCartItemView.as_view(), name='update-cart-item'),
+
+    # Include all router-generated URLs
+    path('', include(router.urls)),
 ]

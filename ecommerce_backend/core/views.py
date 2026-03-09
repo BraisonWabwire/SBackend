@@ -205,3 +205,43 @@ class RemoveCartItemView(APIView):
             return Response({"message": "Item removed from cart"}, status=status.HTTP_204_NO_CONTENT)
         except CartItem.DoesNotExist:
             return Response({"detail": "Cart item not found or does not belong to you"}, status=404)
+        
+
+# core/views.py (add or update)
+from rest_framework import viewsets, permissions
+from rest_framework.response import Response
+from rest_framework import status
+from .models import Product
+from .serializers import ProductSerializer
+
+class IsOwnerOrReadOnly(permissions.BasePermission):
+    """
+    Custom permission: allow anyone to read (list/retrieve), but only owner to delete/update
+    """
+    def has_object_permission(self, request, view, obj):
+        # Read permissions are allowed to any request
+        if request.method in permissions.SAFE_METHODS:
+            return True
+        # Write permissions only for the owner
+        return obj.owner == request.user.userprofile
+
+class ProductViewSet(viewsets.ModelViewSet):
+    """
+    API for products: list all, retrieve, delete (owner only)
+    """
+    serializer_class = ProductSerializer
+    permission_classes = [permissions.IsAuthenticatedOrReadOnly, IsOwnerOrReadOnly]  # authenticated for write, anyone for read
+
+    def get_queryset(self):
+        # Return all products – filter by owner if needed later
+        return Product.objects.all().order_by('-created_at')
+
+    def perform_create(self, serializer):
+        # Set owner automatically on create
+        serializer.save(owner=self.request.user.userprofile)
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        self.perform_destroy(instance)
+        return Response({"message": "Product deleted successfully"}, status=status.HTTP_204_NO_CONTENT)
+

@@ -109,3 +109,27 @@ class CartSerializer(serializers.ModelSerializer):
     class Meta:
         model = Cart
         fields = ['id', 'items', 'total_items', 'total_price', 'created_at', 'updated_at']
+
+
+# core/serializers.py (update or add)
+from rest_framework import serializers
+from .models import Product
+
+class ProductSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Product
+        fields = [
+            'id',
+            'name',
+            'description',
+            'price',
+            'stock_quantity',
+            'barcode',
+            'sku',
+            'image',
+            'is_available',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['owner', 'created_at', 'updated_at']  # owner is set automatically
+
