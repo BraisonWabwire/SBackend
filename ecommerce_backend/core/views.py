@@ -245,3 +245,252 @@ class ProductViewSet(viewsets.ModelViewSet):
         self.perform_destroy(instance)
         return Response({"message": "Product deleted successfully"}, status=status.HTTP_204_NO_CONTENT)
 
+
+
+# core/views.py
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
+from django.conf import settings
+import requests
+import base64
+from datetime import datetime
+from .models import Cart, Order, OrderItem
+
+# core/views.py  → replace your CheckoutView with this version
+class CheckoutView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get_access_token(self):
+        auth_url = (
+            "https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials"
+            if settings.MPESA_ENVIRONMENT == 'sandbox'
+            else "https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials"
+        )
+        auth_string = f"{settings.MPESA_CONSUMER_KEY}:{settings.MPESA_CONSUMER_SECRET}"
+        auth = base64.b64encode(auth_string.encode('utf-8')).decode('utf-8')
+        headers = {"Authorization": f"Basic {auth}"}
+        response = requests.get(auth_url, headers=headers)
+        response.raise_for_status()
+        return response.json()['access_token']
+
+    def _simulate_successful_payment(self, order):
+        """For local testing: mark as paid/completed immediately"""
+        order.is_paid = True
+        order.status = 'completed'
+        order.payment_reference = f"SIM-{order.id}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        order.save(update_fields=['is_paid', 'status', 'payment_reference'])
+
+        # Reduce stock (important!)
+        for item in order.items.select_related('product'):
+            try:
+                item.product.reduce_stock(item.quantity)
+            except ValueError as e:
+                # In real app → log / notify admin / mark order issue
+                print(f"Stock warning (sim): {e}")
+
+        # Clear cart
+        Cart.objects.filter(customer=order.customer).delete()
+
+    def post(self, request):
+        raw_phone = request.data.get('phone', '').strip()
+        if not raw_phone:
+            return Response({'error': 'Phone number is required'}, status=400)
+
+        # Phone normalization (your existing logic – kept as-is)
+        phone_number = raw_phone
+        if phone_number.startswith('0') and len(phone_number) == 10 and phone_number[1].isdigit():
+            phone_number = '254' + phone_number[1:]
+        elif phone_number.startswith('+254'):
+            phone_number = phone_number[1:]
+        elif not (phone_number.startswith('254') and len(phone_number) == 12):
+            return Response(
+                {'error': 'Invalid phone number format. Use 2547xxxxxxxx or 07xxxxxxxx'},
+                status=400
+            )
+
+        if not (phone_number.startswith('254') and len(phone_number) == 12 and phone_number[3:].isdigit()):
+            return Response({'error': 'Invalid phone after normalization'}, status=400)
+
+        try:
+            profile = request.user.userprofile
+            cart = Cart.objects.get(customer=profile)
+
+            if not cart.items.exists():
+                return Response({'error': 'Your cart is empty'}, status=400)
+
+            total_amount = sum(
+                item.product.price * item.quantity for item in cart.items.all()
+            )
+
+            if total_amount <= 0:
+                return Response({'error': 'Invalid order amount'}, status=400)
+
+            # Create order
+            order = Order.objects.create(
+                customer=profile,
+                total_amount=total_amount,
+                is_paid=False,
+                status='pending'
+            )
+
+            # Copy items
+            for item in cart.items.all():
+                OrderItem.objects.create(
+                    order=order,
+                    product=item.product,
+                    quantity=item.quantity,
+                    price_at_purchase=item.product.price
+                )
+
+            # ────────────────────────────────────────
+            #  Simulation mode (for local/test)
+            # ────────────────────────────────────────
+            if getattr(settings, 'MPESA_SIMULATE_SUCCESS', False):
+                self._simulate_successful_payment(order)
+                return Response({
+                    'success': True,
+                    'message': 'TEST MODE: Payment simulated successfully. Order completed.',
+                    'order_id': order.id,
+                    'simulated': True,
+                    'payment_reference': order.payment_reference
+                }, status=200)
+
+            # ────────────────────────────────────────
+            # Real Daraja STK Push
+            # ────────────────────────────────────────
+            timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+            password_str = f"{settings.MPESA_SHORTCODE}{settings.MPESA_PASSKEY}{timestamp}"
+            password = base64.b64encode(password_str.encode('utf-8')).decode('utf-8')
+
+            payload = {
+                "BusinessShortCode": settings.MPESA_SHORTCODE,
+                "Password": password,
+                "Timestamp": timestamp,
+                "TransactionType": "CustomerPayBillOnline",
+                "Amount": str(int(total_amount)),
+                "PartyA": phone_number,
+                "PartyB": settings.MPESA_SHORTCODE,
+                "PhoneNumber": phone_number,
+                "CallBackURL": settings.MPESA_CALLBACK_URL,
+                "AccountReference": f"Order-{order.id}",
+                "TransactionDesc": f"Payment for order #{order.id}"
+            }
+
+            stk_url = (
+                "https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest"
+                if settings.MPESA_ENVIRONMENT == 'sandbox'
+                else "https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest"
+            )
+
+            headers = {
+                "Authorization": f"Bearer {self.get_access_token()}",
+                "Content-Type": "application/json"
+            }
+
+            response = requests.post(stk_url, json=payload, headers=headers)
+
+            if response.status_code != 200:
+                order.delete()
+                return Response({
+                    'success': False,
+                    'error': 'Failed to connect to M-Pesa',
+                    'status': response.status_code,
+                    'detail': response.text
+                }, status=response.status_code)
+
+            resp_data = response.json()
+
+            if resp_data.get('ResponseCode') == '0':
+                # Real mode: just confirm STK sent
+                return Response({
+                    'success': True,
+                    'message': 'Payment request sent! Check your phone for STK prompt.',
+                    'order_id': order.id,
+                    'checkout_request_id': resp_data.get('CheckoutRequestID'),
+                    'merchant_request_id': resp_data.get('MerchantRequestID')
+                }, status=200)
+            else:
+                order.delete()
+                return Response({
+                    'success': False,
+                    'error': resp_data.get('ResponseDescription', 'Daraja rejected request'),
+                    'daraja_response': resp_data
+                }, status=400)
+
+        except Cart.DoesNotExist:
+            return Response({'error': 'Cart not found'}, status=404)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            if 'order' in locals():
+                order.delete()
+            return Response({'error': f'Server error: {str(e)}'}, status=500)
+        
+
+class MpesaCallback(APIView):
+    permission_classes = []  # public endpoint – Safaricom calls it
+
+    def post(self, request):
+        try:
+            body = request.data
+            callback = body.get('Body', {}).get('stkCallback', {})
+            result_code = callback.get('ResultCode')
+
+            if result_code == 0:
+                metadata = callback.get('CallbackMetadata', {}).get('Item', [])
+                receipt = next(
+                    (item['Value'] for item in metadata if item['Name'] == 'MpesaReceiptNumber'),
+                    None
+                )
+
+                # Find the most recent unpaid order (improve this later with checkout_request_id)
+                order = Order.objects.filter(is_paid=False).order_by('-created_at').first()
+
+                if order:
+                    order.is_paid = True
+                    order.payment_reference = receipt
+                    order.status = 'completed'
+                    order.save()
+
+                    # Optional: clear cart
+                    Cart.objects.filter(customer=order.customer).delete()
+
+            # Always respond with success to Safaricom (they retry otherwise)
+            return Response({
+                "ResultCode": 0,
+                "ResultDesc": "Accepted"
+            })
+
+        except Exception as e:
+            return Response({
+                "ResultCode": 1,
+                "ResultDesc": str(e)
+            }, status=500)
+
+
+# core/views.py
+from .serializers import OrderSerializer
+# views.py
+class CustomerOrdersView(generics.ListAPIView):
+    permission_classes = [IsAuthenticated]
+    serializer_class = OrderSerializer
+
+    def get_queryset(self):
+        profile = self.request.user.userprofile
+        qs = Order.objects.filter(customer=profile, status='pending').order_by('-created_at')
+        
+        # print(f"[DEBUG] User: {self.request.user.username}")
+        # print(f"[DEBUG] Found {qs.count()} orders")
+        
+        return qs
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        serializer = self.get_serializer(queryset, many=True)
+        
+        # print(f"[DEBUG] Serialized data type: {type(serializer.data)}")
+        # print(f"[DEBUG] First few items: {serializer.data[:2] if serializer.data else 'empty'}")
+        
+        return Response(serializer.data)

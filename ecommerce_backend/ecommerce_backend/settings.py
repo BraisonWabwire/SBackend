@@ -41,6 +41,7 @@ INSTALLED_APPS = [
     'rest_framework.authtoken',
     'corsheaders',
     'core',
+    'django_daraja',
 ]
 
 MIDDLEWARE = [
@@ -130,17 +131,20 @@ DATABASES = {
         'USER': 'postgres',
         'PASSWORD': '@Wabwire7627',
         'HOST': 'localhost',
-        'PORT': '5433',
+        'PORT': '5432',
     }
 }
 
 
 CORS_ALLOWED_ORIGINS = [
-    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
     "http://127.0.0.1:5173",
+    "http://localhost:5173",
     # add production frontend later
 ]
 
+CORS_ALLOW_CREDENTIALS = True
 
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [
@@ -157,3 +161,15 @@ REST_FRAMEWORK = {
 
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
+
+
+from datetime import timedelta
+
+# M-Pesa Settings
+MPESA_ENVIRONMENT = 'sandbox'  # change to 'production' later
+
+MPESA_CONSUMER_KEY = '2xr9fR17WcfuWSaTdIf6vTF85Kth0Fpv0GoBAiaLRjCKZuAx'
+MPESA_CONSUMER_SECRET = 'k29xM8SNcMJObqbezb9Q7bYhG0ebKYbxn8LJRAUIXcdgFhodahKjcAehoBOc1cG0'
+MPESA_SHORTCODE = '174379'  # sandbox default
+MPESA_PASSKEY = 'bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919'
+MPESA_CALLBACK_URL = 'https://mydomain.com/mpesa-express-simulate/'

@@ -108,3 +108,53 @@ class CartItem(models.Model):
     @property
     def subtotal(self):
         return self.quantity * self.product.price
+    
+
+from django.db import models
+from django.contrib.auth.models import User
+from django.utils import timezone
+
+class Order(models.Model):
+    """
+    Represents a finalized order after checkout/payment.
+    """
+    customer = models.ForeignKey(
+        'UserProfile',
+        on_delete=models.CASCADE,
+        limit_choices_to={'role': 'customer'},
+        related_name='orders'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    is_paid = models.BooleanField(default=False)
+    total_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    payment_reference = models.CharField(max_length=100, blank=True, null=True)  # e.g. Mpesa receipt
+    status = models.CharField(
+        max_length=50,
+        choices=[
+            ('pending', 'Pending'),
+            ('completed', 'Completed'),
+            ('cancelled', 'Cancelled')
+        ],
+        default='pending'
+    )
+
+    def __str__(self):
+        return f"Order {self.id} by {self.customer.username} - {self.status}"
+
+
+class OrderItem(models.Model):
+    """
+    Individual product in an order.
+    """
+    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='items')
+    product = models.ForeignKey('Product', on_delete=models.SET_NULL, null=True)
+    quantity = models.PositiveIntegerField(default=1)
+    price_at_purchase = models.DecimalField(max_digits=12, decimal_places=2)
+
+    def __str__(self):
+        return f"{self.quantity} x {self.product.name if self.product else 'Deleted Product'}"
+
+    @property
+    def subtotal(self):
+        return self.quantity * self.price_at_purchase
