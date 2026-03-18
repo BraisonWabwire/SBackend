@@ -494,3 +494,41 @@ class CustomerOrdersView(generics.ListAPIView):
         # print(f"[DEBUG] First few items: {serializer.data[:2] if serializer.data else 'empty'}")
         
         return Response(serializer.data)
+    
+# core/views.py
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
+from django.db.models import Sum           # ← Add this import!
+from .models import Product, Order
+
+
+class OwnerStatsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        profile = request.user.userprofile
+        if profile.role != 'owner':
+            return Response({"error": "Not authorized"}, status=403)
+
+        products = Product.objects.filter(owner=profile)
+        low_stock = products.filter(stock_quantity__lt=10).count()
+        total_products = products.count()
+
+        # Sales from completed orders containing these products
+        completed_orders = Order.objects.filter(status='completed')
+        relevant_orders = completed_orders.filter(items__product__owner=profile).distinct()
+
+        # Correct aggregation using django.db.models.Sum
+        total_sales_result = relevant_orders.aggregate(total=Sum('total_amount'))
+        total_sales = total_sales_result['total'] or 0
+
+        total_orders = relevant_orders.count()
+
+        return Response({
+            'total_sales': total_sales,
+            'total_orders': total_orders,
+            'low_stock_products': low_stock,
+            'total_products': total_products,
+        })

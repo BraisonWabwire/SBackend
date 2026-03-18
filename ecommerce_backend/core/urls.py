@@ -12,8 +12,8 @@ from .views import (
     RemoveCartItemView,
     CheckoutView,
     MpesaCallback,
-    CustomerOrdersView
-    
+    CustomerOrdersView,
+    OwnerStatsView
     # UpdateCartItemView,      # optional – for quantity update
 )
 
@@ -39,7 +39,10 @@ urlpatterns = [
     
     # Optional: if you add PATCH for quantity update
     path('checkout/', CheckoutView.as_view(), name='checkout'),
+    path('ownerStats/', OwnerStatsView.as_view(), name='OwnerStats'),
+
     path('mpesa/callback/', MpesaCallback.as_view(), name='mpesa-callback'),
+
 
     # path('cart/items/<int:pk>/update/', UpdateCartItemView.as_view(), name='update-cart-item'),
 

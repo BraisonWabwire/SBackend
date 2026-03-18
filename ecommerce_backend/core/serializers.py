@@ -179,3 +179,37 @@ class OrderSerializer(serializers.ModelSerializer):
             'payment_reference',
             'items'
         ]
+
+# core/serializers.py
+
+from rest_framework import serializers
+from decimal import Decimal
+
+
+class OwnerStatsSerializer(serializers.Serializer):
+    """
+    Serializer for owner dashboard statistics.
+    Returns aggregated data for the authenticated shop owner.
+    """
+    total_sales = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        help_text="Total sales amount from completed orders (KES)"
+    )
+    
+    total_orders = serializers.IntegerField(
+        default=0,
+        help_text="Number of completed orders containing the owner's products"
+    )
+    
+    low_stock_products = serializers.IntegerField(
+        default=0,
+        help_text="Number of products with stock quantity less than 10"
+    )
+    
+    total_products = serializers.IntegerField(
+        default=0,
+        help_text="Total number of products owned by this shop owner"
+    )
+
