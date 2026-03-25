@@ -1,180 +1,172 @@
-# Views
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
+import base64
+import re
+from datetime import datetime
+from decimal import Decimal
+
+import requests
+from django.conf import settings
+from django.db.models import DecimalField, F, Sum
+from rest_framework import generics, permissions, status, viewsets
 from rest_framework.authtoken.models import Token
-from .serializers import RegisterSerializer, LoginSerializer
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from .models import Cart, CartItem, Order, OrderItem, Product, UserProfile
+from .serializers import (
+    CartSerializer,
+    LoginSerializer,
+    OrderSerializer,
+    OwnerStatsSerializer,
+    ProductSerializer,
+    RegisterSerializer,
+)
 
 
 class RegisterView(APIView):
-    """
-    Register a new user (shop owner or customer) and return auth token
-    """
-    permission_classes = []           # anyone can register
+    permission_classes = []
     authentication_classes = []
 
     def post(self, request):
         serializer = RegisterSerializer(data=request.data)
-        if serializer.is_valid():
-            user = serializer.save()
-            token, _ = Token.objects.get_or_create(user=user)
-            profile = user.userprofile  # from OneToOne
+        serializer.is_valid(raise_exception=True)
 
-            return Response({
+        user = serializer.save()
+        token, _ = Token.objects.get_or_create(user=user)
+        profile = user.userprofile
+
+        return Response(
+            {
                 "token": token.key,
                 "user": {
                     "id": user.id,
                     "username": user.username,
                     "email": user.email,
                     "role": profile.role,
-                    "contact_info": profile.contact_info
+                    "contact_info": profile.contact_info,
                 },
-                "message": "Account created successfully."
-            }, status=status.HTTP_201_CREATED)
-
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+                "message": "Account created successfully.",
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class LoginView(APIView):
-    """
-    Login and return auth token
-    """
     permission_classes = []
     authentication_classes = []
 
     def post(self, request):
         serializer = LoginSerializer(data=request.data)
-        if serializer.is_valid():
-            user = serializer.validated_data
-            token, _ = Token.objects.get_or_create(user=user)
+        serializer.is_valid(raise_exception=True)
 
-            profile = user.userprofile
+        user = serializer.validated_data
+        token, _ = Token.objects.get_or_create(user=user)
+        profile = user.userprofile
 
-            return Response({
+        return Response(
+            {
                 "token": token.key,
                 "user": {
                     "id": user.id,
                     "username": user.username,
                     "email": user.email,
                     "role": profile.role,
-                    "contact_info": profile.contact_info
-                }
-            }, status=status.HTTP_200_OK)
-
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-
-# core/views.py
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-from rest_framework.permissions import IsAuthenticated
-from .models import Product, UserProfile
-from .serializers import ProductCreateSerializer
-
-
-class AddProductView(APIView):
-    """
-    POST /api/products/add/
-    Only authenticated users with role='owner' can add products
-    """
-    permission_classes = [IsAuthenticated]
-
-    def post(self, request):
-        # Check if user has owner role
-        try:
-            profile = request.user.userprofile
-            if profile.role != 'owner':
-                return Response(
-                    {"detail": "Only shop owners can add products."},
-                    status=status.HTTP_403_FORBIDDEN
-                )
-        except UserProfile.DoesNotExist:
-            return Response(
-                {"detail": "User profile not found."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        serializer = ProductCreateSerializer(data=request.data)
-
-        if serializer.is_valid():
-            # Automatically assign the current owner
-            product = serializer.save(owner=profile)
-
-            return Response(
-                {
-                    "message": "Product added successfully",
-                    "product": ProductCreateSerializer(product).data
+                    "contact_info": profile.contact_info,
                 },
-                status=status.HTTP_201_CREATED
-            )
-
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            }
+        )
 
 
-from rest_framework import generics
-from rest_framework.permissions import AllowAny   # or IsAuthenticated if you want only logged-in users
-from .models import Product
-from .serializers import ProductSerializer
+class IsOwnerOrReadOnly(permissions.BasePermission):
+    def has_permission(self, request, view):
+        if request.method in permissions.SAFE_METHODS:
+            return True
+
+        if not request.user or not request.user.is_authenticated:
+            return False
+
+        profile = getattr(request.user, "userprofile", None)
+        return profile is not None and profile.role == "owner"
+
+    def has_object_permission(self, request, view, obj):
+        if request.method in permissions.SAFE_METHODS:
+            return True
+        profile = getattr(request.user, "userprofile", None)
+        return profile is not None and obj.owner_id == profile.id
 
 
-class ProductListView(generics.ListAPIView):
-    """
-    GET /api/products/
-    Returns list of all products (public or filtered later)
-    """
-    queryset = Product.objects.filter(is_available=True)
+class ProductViewSet(viewsets.ModelViewSet):
     serializer_class = ProductSerializer
-    permission_classes = [AllowAny]  # change to IsAuthenticated if needed
+    permission_classes = [IsOwnerOrReadOnly]
 
+    def get_queryset(self):
+        queryset = Product.objects.select_related("owner__user").order_by("-created_at")
+        if self.request.method in permissions.SAFE_METHODS:
+            profile = getattr(self.request.user, "userprofile", None)
+            if (
+                profile is not None
+                and profile.role == "owner"
+                and self.request.query_params.get("scope") == "owner"
+            ):
+                return queryset.filter(owner=profile)
+            return queryset.filter(is_available=True, stock_quantity__gt=0)
+        return queryset
 
-from rest_framework import status
-from rest_framework.permissions import IsAuthenticated
-from rest_framework.response import Response
-from rest_framework.views import APIView
-from .models import Cart, CartItem, Product, UserProfile
-from .serializers import CartSerializer, CartItemSerializer
+    def perform_create(self, serializer):
+        profile = self.request.user.userprofile
+        serializer.save(owner=profile)
 
 
 class AddToCartView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        try:
-            profile = request.user.userprofile
-            if profile.role != 'customer':
-                return Response({"detail": "Only customers can add to cart"}, status=403)
-        except UserProfile.DoesNotExist:
+        profile = getattr(request.user, "userprofile", None)
+        if profile is None:
             return Response({"detail": "Profile not found"}, status=400)
+        if profile.role != "customer":
+            return Response({"detail": "Only customers can add to cart"}, status=403)
 
-        product_id = request.data.get('product_id')
-        quantity = request.data.get('quantity', 1)
+        product_id = request.data.get("product_id")
+        quantity = request.data.get("quantity", 1)
+
+        try:
+            quantity = int(quantity)
+        except (TypeError, ValueError):
+            return Response({"detail": "Quantity must be a whole number"}, status=400)
+
+        if quantity < 1:
+            return Response({"detail": "Quantity must be at least 1"}, status=400)
 
         if not product_id:
             return Response({"detail": "product_id is required"}, status=400)
 
         try:
-            product = Product.objects.get(id=product_id)
+            product = Product.objects.get(id=product_id, is_available=True, stock_quantity__gt=0)
         except Product.DoesNotExist:
             return Response({"detail": "Product not found"}, status=404)
 
-        # Get or create cart
-        cart, created = Cart.objects.get_or_create(customer=profile)
-
-        # Check if item already in cart
+        cart, _ = Cart.objects.get_or_create(customer=profile)
         cart_item, created = CartItem.objects.get_or_create(
             cart=cart,
             product=product,
-            defaults={'quantity': quantity}
+            defaults={"quantity": quantity},
         )
 
+        new_quantity = quantity if created else cart_item.quantity + quantity
+        if new_quantity > product.stock_quantity:
+            return Response(
+                {"detail": f"Only {product.stock_quantity} item(s) available in stock"},
+                status=400,
+            )
+
         if not created:
-            cart_item.quantity += int(quantity)
-            cart_item.save()
+            cart_item.quantity = new_quantity
+            cart_item.save(update_fields=["quantity"])
 
         return Response(
             {"message": "Added to cart", "cart": CartSerializer(cart).data},
-            status=status.HTTP_201_CREATED
+            status=status.HTTP_201_CREATED,
         )
 
 
@@ -182,187 +174,196 @@ class CartView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        try:
-            cart = Cart.objects.get(customer=request.user.userprofile)
-            return Response(CartSerializer(cart).data)
-        except Cart.DoesNotExist:
-            return Response({"items": [], "total_items": 0, "total_price": "0.00"})
-
-class RemoveCartItemView(APIView):
-    permission_classes = [IsAuthenticated]
-
-    def delete(self, request, pk):
-        try:
-            profile = request.user.userprofile
-            if profile.role != 'customer':
-                return Response({"detail": "Only customers can modify cart"}, status=403)
-        except UserProfile.DoesNotExist:
+        profile = getattr(request.user, "userprofile", None)
+        if profile is None:
             return Response({"detail": "Profile not found"}, status=400)
 
+        cart, _ = Cart.objects.get_or_create(customer=profile)
+        return Response(CartSerializer(cart).data)
+
+
+class CartItemView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def _get_customer_item(self, request, pk):
+        profile = getattr(request.user, "userprofile", None)
+        if profile is None:
+            return None, Response({"detail": "Profile not found"}, status=400)
+        if profile.role != "customer":
+            return None, Response({"detail": "Only customers can modify cart"}, status=403)
+
         try:
-            cart_item = CartItem.objects.get(id=pk, cart__customer=profile)
-            cart_item.delete()
-            return Response({"message": "Item removed from cart"}, status=status.HTTP_204_NO_CONTENT)
+            return CartItem.objects.select_related("product", "cart").get(
+                id=pk,
+                cart__customer=profile,
+            ), None
         except CartItem.DoesNotExist:
-            return Response({"detail": "Cart item not found or does not belong to you"}, status=404)
-        
+            return None, Response(
+                {"detail": "Cart item not found or does not belong to you"},
+                status=404,
+            )
 
-# core/views.py (add or update)
-from rest_framework import viewsets, permissions
-from rest_framework.response import Response
-from rest_framework import status
-from .models import Product
-from .serializers import ProductSerializer
+    def patch(self, request, pk):
+        cart_item, error_response = self._get_customer_item(request, pk)
+        if error_response:
+            return error_response
 
-class IsOwnerOrReadOnly(permissions.BasePermission):
-    """
-    Custom permission: allow anyone to read (list/retrieve), but only owner to delete/update
-    """
-    def has_object_permission(self, request, view, obj):
-        # Read permissions are allowed to any request
-        if request.method in permissions.SAFE_METHODS:
-            return True
-        # Write permissions only for the owner
-        return obj.owner == request.user.userprofile
+        quantity = request.data.get("quantity")
+        try:
+            quantity = int(quantity)
+        except (TypeError, ValueError):
+            return Response({"detail": "Quantity must be a whole number"}, status=400)
 
-class ProductViewSet(viewsets.ModelViewSet):
-    """
-    API for products: list all, retrieve, delete (owner only)
-    """
-    serializer_class = ProductSerializer
-    permission_classes = [permissions.IsAuthenticatedOrReadOnly, IsOwnerOrReadOnly]  # authenticated for write, anyone for read
+        if quantity < 1:
+            return Response({"detail": "Quantity must be at least 1"}, status=400)
+        if quantity > cart_item.product.stock_quantity:
+            return Response(
+                {"detail": f"Only {cart_item.product.stock_quantity} item(s) available in stock"},
+                status=400,
+            )
 
-    def get_queryset(self):
-        # Return all products – filter by owner if needed later
-        return Product.objects.all().order_by('-created_at')
+        cart_item.quantity = quantity
+        cart_item.save(update_fields=["quantity"])
+        return Response({"message": "Cart item updated", "cart": CartSerializer(cart_item.cart).data})
 
-    def perform_create(self, serializer):
-        # Set owner automatically on create
-        serializer.save(owner=self.request.user.userprofile)
+    def delete(self, request, pk):
+        cart_item, error_response = self._get_customer_item(request, pk)
+        if error_response:
+            return error_response
 
-    def destroy(self, request, *args, **kwargs):
-        instance = self.get_object()
-        self.perform_destroy(instance)
-        return Response({"message": "Product deleted successfully"}, status=status.HTTP_204_NO_CONTENT)
+        cart_item.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
-
-# core/views.py
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-from rest_framework.permissions import IsAuthenticated
-from django.conf import settings
-import requests
-import base64
-from datetime import datetime
-from .models import Cart, Order, OrderItem
-
-# core/views.py  → replace your CheckoutView with this version
 class CheckoutView(APIView):
     permission_classes = [IsAuthenticated]
+    PHONE_PATTERN = re.compile(r"^(?:0[71]\d{8}|\+254[71]\d{8}|254[71]\d{8})$")
 
     def get_access_token(self):
         auth_url = (
             "https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials"
-            if settings.MPESA_ENVIRONMENT == 'sandbox'
+            if settings.MPESA_ENVIRONMENT == "sandbox"
             else "https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials"
         )
         auth_string = f"{settings.MPESA_CONSUMER_KEY}:{settings.MPESA_CONSUMER_SECRET}"
-        auth = base64.b64encode(auth_string.encode('utf-8')).decode('utf-8')
+        auth = base64.b64encode(auth_string.encode("utf-8")).decode("utf-8")
         headers = {"Authorization": f"Basic {auth}"}
-        response = requests.get(auth_url, headers=headers)
+        response = requests.get(auth_url, headers=headers, timeout=30)
         response.raise_for_status()
-        return response.json()['access_token']
+        return response.json()["access_token"]
 
-    def _simulate_successful_payment(self, order):
-        """For local testing: mark as paid/completed immediately"""
+    def _normalize_phone_number(self, raw_phone):
+        phone_number = (raw_phone or "").strip()
+        if not phone_number:
+            return None
+        if not self.PHONE_PATTERN.match(phone_number):
+            return None
+        if phone_number.startswith("+254"):
+            return phone_number[1:]
+        if phone_number.startswith("0"):
+            return f"254{phone_number[1:]}"
+        return phone_number
+
+    def _complete_order(self, order, payment_reference):
+        if order.is_paid:
+            return
+
         order.is_paid = True
-        order.status = 'completed'
-        order.payment_reference = f"SIM-{order.id}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-        order.save(update_fields=['is_paid', 'status', 'payment_reference'])
+        order.status = "pending"
+        order.payment_reference = payment_reference
+        order.save(update_fields=["is_paid", "status", "payment_reference"])
 
-        # Reduce stock (important!)
-        for item in order.items.select_related('product'):
-            try:
+        for item in order.items.select_related("product"):
+            if item.product:
                 item.product.reduce_stock(item.quantity)
-            except ValueError as e:
-                # In real app → log / notify admin / mark order issue
-                print(f"Stock warning (sim): {e}")
 
-        # Clear cart
         Cart.objects.filter(customer=order.customer).delete()
 
+    def _simulate_successful_payment(self, order):
+        self._complete_order(
+            order,
+            f"SIM-{order.id}-{datetime.now().strftime('%Y%m%d%H%M%S')}",
+        )
+
     def post(self, request):
-        raw_phone = request.data.get('phone', '').strip()
-        if not raw_phone:
-            return Response({'error': 'Phone number is required'}, status=400)
+        profile = getattr(request.user, "userprofile", None)
+        if profile is None:
+            return Response({"error": "Profile not found"}, status=400)
+        if profile.role != "customer":
+            return Response({"error": "Only customers can checkout"}, status=403)
 
-        # Phone normalization (your existing logic – kept as-is)
-        phone_number = raw_phone
-        if phone_number.startswith('0') and len(phone_number) == 10 and phone_number[1].isdigit():
-            phone_number = '254' + phone_number[1:]
-        elif phone_number.startswith('+254'):
-            phone_number = phone_number[1:]
-        elif not (phone_number.startswith('254') and len(phone_number) == 12):
+        raw_phone = request.data.get("phone", "")
+        if not str(raw_phone).strip():
+            return Response({"error": "Phone number is required"}, status=400)
+
+        phone_number = self._normalize_phone_number(raw_phone)
+        if phone_number is None:
             return Response(
-                {'error': 'Invalid phone number format. Use 2547xxxxxxxx or 07xxxxxxxx'},
-                status=400
+                {
+                    "error": (
+                        "Invalid phone number format. Use 07xxxxxxxx, 01xxxxxxxx, "
+                        "+2547xxxxxxxx, +2541xxxxxxx, 2547xxxxxxxx, or 2541xxxxxxx."
+                    )
+                },
+                status=400,
             )
-
-        if not (phone_number.startswith('254') and len(phone_number) == 12 and phone_number[3:].isdigit()):
-            return Response({'error': 'Invalid phone after normalization'}, status=400)
 
         try:
-            profile = request.user.userprofile
-            cart = Cart.objects.get(customer=profile)
+            cart = Cart.objects.prefetch_related("items__product").get(customer=profile)
+        except Cart.DoesNotExist:
+            return Response({"error": "Cart not found"}, status=404)
 
-            if not cart.items.exists():
-                return Response({'error': 'Your cart is empty'}, status=400)
+        if not cart.items.exists():
+            return Response({"error": "Your cart is empty"}, status=400)
 
-            total_amount = sum(
-                item.product.price * item.quantity for item in cart.items.all()
-            )
-
-            if total_amount <= 0:
-                return Response({'error': 'Invalid order amount'}, status=400)
-
-            # Create order
-            order = Order.objects.create(
-                customer=profile,
-                total_amount=total_amount,
-                is_paid=False,
-                status='pending'
-            )
-
-            # Copy items
-            for item in cart.items.all():
-                OrderItem.objects.create(
-                    order=order,
-                    product=item.product,
-                    quantity=item.quantity,
-                    price_at_purchase=item.product.price
+        cart_items = list(cart.items.all())
+        for item in cart_items:
+            if item.product is None or not item.product.is_available:
+                return Response(
+                    {"error": f"{item.product.name if item.product else 'A product'} is no longer available"},
+                    status=400,
+                )
+            if item.quantity > item.product.stock_quantity:
+                return Response(
+                    {"error": f"Not enough stock for {item.product.name}. Available: {item.product.stock_quantity}"},
+                    status=400,
                 )
 
-            # ────────────────────────────────────────
-            #  Simulation mode (for local/test)
-            # ────────────────────────────────────────
-            if getattr(settings, 'MPESA_SIMULATE_SUCCESS', False):
-                self._simulate_successful_payment(order)
-                return Response({
-                    'success': True,
-                    'message': 'TEST MODE: Payment simulated successfully. Order completed.',
-                    'order_id': order.id,
-                    'simulated': True,
-                    'payment_reference': order.payment_reference
-                }, status=200)
+        total_amount = sum(item.product.price * item.quantity for item in cart_items)
+        if total_amount <= 0:
+            return Response({"error": "Invalid order amount"}, status=400)
 
-            # ────────────────────────────────────────
-            # Real Daraja STK Push
-            # ────────────────────────────────────────
-            timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+        order = Order.objects.create(
+            customer=profile,
+            total_amount=total_amount,
+            is_paid=False,
+            status="pending",
+        )
+
+        for item in cart_items:
+            OrderItem.objects.create(
+                order=order,
+                product=item.product,
+                quantity=item.quantity,
+                price_at_purchase=item.product.price,
+            )
+
+        if getattr(settings, "MPESA_SIMULATE_SUCCESS", False):
+            self._simulate_successful_payment(order)
+            return Response(
+                {
+                    "success": True,
+                    "message": "TEST MODE: Payment simulated successfully. Order is awaiting seller approval.",
+                    "order_id": order.id,
+                    "simulated": True,
+                    "payment_reference": order.payment_reference,
+                }
+            )
+
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
             password_str = f"{settings.MPESA_SHORTCODE}{settings.MPESA_PASSKEY}{timestamp}"
-            password = base64.b64encode(password_str.encode('utf-8')).decode('utf-8')
+            password = base64.b64encode(password_str.encode("utf-8")).decode("utf-8")
 
             payload = {
                 "BusinessShortCode": settings.MPESA_SHORTCODE,
@@ -375,160 +376,211 @@ class CheckoutView(APIView):
                 "PhoneNumber": phone_number,
                 "CallBackURL": settings.MPESA_CALLBACK_URL,
                 "AccountReference": f"Order-{order.id}",
-                "TransactionDesc": f"Payment for order #{order.id}"
+                "TransactionDesc": f"Payment for order #{order.id}",
             }
 
             stk_url = (
                 "https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest"
-                if settings.MPESA_ENVIRONMENT == 'sandbox'
+                if settings.MPESA_ENVIRONMENT == "sandbox"
                 else "https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest"
             )
 
             headers = {
                 "Authorization": f"Bearer {self.get_access_token()}",
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
             }
-
-            response = requests.post(stk_url, json=payload, headers=headers)
+            response = requests.post(stk_url, json=payload, headers=headers, timeout=30)
 
             if response.status_code != 200:
-                order.delete()
-                return Response({
-                    'success': False,
-                    'error': 'Failed to connect to M-Pesa',
-                    'status': response.status_code,
-                    'detail': response.text
-                }, status=response.status_code)
+                return Response(
+                    {
+                        "success": True,
+                        "message": "Order saved as pending. STK push was not confirmed, but the seller can still approve it.",
+                        "warning": "Failed to connect to M-Pesa",
+                        "order_id": order.id,
+                        "status": response.status_code,
+                        "detail": response.text,
+                    },
+                    status=status.HTTP_202_ACCEPTED,
+                )
 
             resp_data = response.json()
+            if resp_data.get("ResponseCode") == "0":
+                checkout_request_id = resp_data.get("CheckoutRequestID")
+                payment_reference = checkout_request_id or f"STK-{order.id}-{timestamp}"
+                self._complete_order(order, payment_reference)
+                return Response(
+                    {
+                        "success": True,
+                        "message": "Payment request sent successfully. Order is awaiting seller approval.",
+                        "order_id": order.id,
+                        "checkout_request_id": checkout_request_id,
+                        "merchant_request_id": resp_data.get("MerchantRequestID"),
+                    }
+                )
 
-            if resp_data.get('ResponseCode') == '0':
-                # Real mode: just confirm STK sent
-                return Response({
-                    'success': True,
-                    'message': 'Payment request sent! Check your phone for STK prompt.',
-                    'order_id': order.id,
-                    'checkout_request_id': resp_data.get('CheckoutRequestID'),
-                    'merchant_request_id': resp_data.get('MerchantRequestID')
-                }, status=200)
-            else:
-                order.delete()
-                return Response({
-                    'success': False,
-                    'error': resp_data.get('ResponseDescription', 'Daraja rejected request'),
-                    'daraja_response': resp_data
-                }, status=400)
+            return Response(
+                {
+                    "success": True,
+                    "message": "Order saved as pending. STK push was not confirmed, but the seller can still approve it.",
+                    "warning": resp_data.get("ResponseDescription", "Daraja rejected request"),
+                    "order_id": order.id,
+                    "daraja_response": resp_data,
+                },
+                status=status.HTTP_202_ACCEPTED,
+            )
+        except requests.RequestException as exc:
+            return Response(
+                {
+                    "success": True,
+                    "message": "Order saved as pending. M-Pesa could not be reached, but the seller can still approve it.",
+                    "warning": f"M-Pesa request failed: {exc}",
+                    "order_id": order.id,
+                },
+                status=status.HTTP_202_ACCEPTED,
+            )
+        except Exception as exc:
+            return Response(
+                {
+                    "success": True,
+                    "message": "Order saved as pending, but there was a server issue confirming the STK push.",
+                    "warning": f"Server error: {exc}",
+                    "order_id": order.id,
+                },
+                status=status.HTTP_202_ACCEPTED,
+            )
 
-        except Cart.DoesNotExist:
-            return Response({'error': 'Cart not found'}, status=404)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            if 'order' in locals():
-                order.delete()
-            return Response({'error': f'Server error: {str(e)}'}, status=500)
-        
 
 class MpesaCallback(APIView):
-    permission_classes = []  # public endpoint – Safaricom calls it
+    permission_classes = []
+    authentication_classes = []
 
     def post(self, request):
         try:
-            body = request.data
-            callback = body.get('Body', {}).get('stkCallback', {})
-            result_code = callback.get('ResultCode')
+            callback = request.data.get("Body", {}).get("stkCallback", {})
+            if callback.get("ResultCode") != 0:
+                return Response({"ResultCode": 0, "ResultDesc": "Accepted"})
 
-            if result_code == 0:
-                metadata = callback.get('CallbackMetadata', {}).get('Item', [])
-                receipt = next(
-                    (item['Value'] for item in metadata if item['Name'] == 'MpesaReceiptNumber'),
-                    None
-                )
+            metadata = callback.get("CallbackMetadata", {}).get("Item", [])
+            receipt = next(
+                (item["Value"] for item in metadata if item.get("Name") == "MpesaReceiptNumber"),
+                None,
+            )
 
-                # Find the most recent unpaid order (improve this later with checkout_request_id)
-                order = Order.objects.filter(is_paid=False).order_by('-created_at').first()
+            order = Order.objects.filter(is_paid=False).order_by("-created_at").first()
+            if order:
+                CheckoutView()._complete_order(order, receipt or order.payment_reference or f"MPESA-{order.id}")
 
-                if order:
-                    order.is_paid = True
-                    order.payment_reference = receipt
-                    order.status = 'completed'
-                    order.save()
-
-                    # Optional: clear cart
-                    Cart.objects.filter(customer=order.customer).delete()
-
-            # Always respond with success to Safaricom (they retry otherwise)
-            return Response({
-                "ResultCode": 0,
-                "ResultDesc": "Accepted"
-            })
-
-        except Exception as e:
-            return Response({
-                "ResultCode": 1,
-                "ResultDesc": str(e)
-            }, status=500)
+            return Response({"ResultCode": 0, "ResultDesc": "Accepted"})
+        except Exception as exc:
+            return Response({"ResultCode": 1, "ResultDesc": str(exc)}, status=500)
 
 
-# core/views.py
-from .serializers import OrderSerializer
-# views.py
 class CustomerOrdersView(generics.ListAPIView):
     permission_classes = [IsAuthenticated]
     serializer_class = OrderSerializer
+    pagination_class = None
 
     def get_queryset(self):
-        profile = self.request.user.userprofile
-        qs = Order.objects.filter(customer=profile, status='pending').order_by('-created_at')
-        
-        # print(f"[DEBUG] User: {self.request.user.username}")
-        # print(f"[DEBUG] Found {qs.count()} orders")
-        
-        return qs
+        profile = getattr(self.request.user, "userprofile", None)
+        if profile is None or profile.role != "customer":
+            return Order.objects.none()
+        return (
+            Order.objects.filter(customer=profile)
+            .exclude(status="completed")
+            .prefetch_related("items__product", "customer__user")
+            .order_by("-created_at")
+        )
 
-    def list(self, request, *args, **kwargs):
-        queryset = self.filter_queryset(self.get_queryset())
-        serializer = self.get_serializer(queryset, many=True)
-        
-        # print(f"[DEBUG] Serialized data type: {type(serializer.data)}")
-        # print(f"[DEBUG] First few items: {serializer.data[:2] if serializer.data else 'empty'}")
-        
-        return Response(serializer.data)
-    
-# core/views.py
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-from rest_framework.permissions import IsAuthenticated
-from django.db.models import Sum           # ← Add this import!
-from .models import Product, Order
+
+class OwnerOrdersView(generics.ListAPIView):
+    permission_classes = [IsAuthenticated]
+    serializer_class = OrderSerializer
+    pagination_class = None
+
+    def get_queryset(self):
+        profile = getattr(self.request.user, "userprofile", None)
+        if profile is None or profile.role != "owner":
+            return Order.objects.none()
+        queryset = (
+            Order.objects.filter(items__product__owner=profile)
+            .distinct()
+            .prefetch_related("items__product", "customer__user")
+            .order_by("-created_at")
+        )
+        approval_filter = self.request.query_params.get("approval")
+        if approval_filter == "approved":
+            queryset = queryset.filter(status="approved")
+        elif approval_filter == "unapproved":
+            queryset = queryset.filter(status="pending")
+        return queryset
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context["owner_profile"] = self.request.user.userprofile
+        return context
+
+
+class OwnerApproveOrderView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, pk):
+        profile = getattr(request.user, "userprofile", None)
+        if profile is None:
+            return Response({"error": "Profile not found"}, status=400)
+        if profile.role != "owner":
+            return Response({"error": "Not authorized"}, status=403)
+
+        try:
+            order = (
+                Order.objects.filter(items__product__owner=profile)
+                .distinct()
+                .prefetch_related("items__product")
+                .get(pk=pk)
+            )
+        except Order.DoesNotExist:
+            return Response({"error": "Order not found"}, status=404)
+
+        if order.status == "approved":
+            return Response({"message": "Order already approved"}, status=200)
+        if order.status == "cancelled":
+            return Response({"error": "Cancelled orders cannot be approved"}, status=400)
+
+        order.status = "approved"
+        order.save(update_fields=["status", "updated_at"])
+        return Response({"message": "Order approved successfully"})
 
 
 class OwnerStatsView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        profile = request.user.userprofile
-        if profile.role != 'owner':
+        profile = getattr(request.user, "userprofile", None)
+        if profile is None:
+            return Response({"error": "Profile not found"}, status=400)
+        if profile.role != "owner":
             return Response({"error": "Not authorized"}, status=403)
 
         products = Product.objects.filter(owner=profile)
         low_stock = products.filter(stock_quantity__lt=10).count()
         total_products = products.count()
 
-        # Sales from completed orders containing these products
-        completed_orders = Order.objects.filter(status='completed')
-        relevant_orders = completed_orders.filter(items__product__owner=profile).distinct()
+        owner_order_items = OrderItem.objects.filter(
+            order__status="approved",
+            product__owner=profile,
+        )
+        total_sales = owner_order_items.aggregate(
+            total=Sum(
+                F("quantity") * F("price_at_purchase"),
+                output_field=DecimalField(max_digits=12, decimal_places=2),
+            )
+        )["total"] or Decimal("0.00")
+        total_orders = owner_order_items.values("order_id").distinct().count()
 
-        # Correct aggregation using django.db.models.Sum
-        total_sales_result = relevant_orders.aggregate(total=Sum('total_amount'))
-        total_sales = total_sales_result['total'] or 0
-
-        total_orders = relevant_orders.count()
-
-        return Response({
-            'total_sales': total_sales,
-            'total_orders': total_orders,
-            'low_stock_products': low_stock,
-            'total_products': total_products,
-        })
+        payload = {
+            "total_sales": total_sales,
+            "total_orders": total_orders,
+            "low_stock_products": low_stock,
+            "total_products": total_products,
+        }
+        return Response(OwnerStatsSerializer(payload).data)

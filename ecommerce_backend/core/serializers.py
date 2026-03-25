@@ -1,52 +1,52 @@
-from rest_framework import serializers
-from django.contrib.auth.models import User
-from django.contrib.auth import authenticate
-from .models import UserProfile
 from decimal import Decimal
 
-# ────────────────────────────────────────────────
-# Signup / Registration Serializer
-# ────────────────────────────────────────────────
+from django.contrib.auth import authenticate
+from django.contrib.auth.models import User
+from rest_framework import serializers
+
+from .models import Cart, CartItem, Order, OrderItem, Product, UserProfile
+
+
 class RegisterSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, min_length=8)
     password2 = serializers.CharField(write_only=True, label="Confirm password")
-    role = serializers.ChoiceField(choices=[('owner', 'Shop Owner'), ('customer', 'Customer')], write_only=True)
-    contact_info = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    role = serializers.ChoiceField(
+        choices=[("owner", "Shop Owner"), ("customer", "Customer")],
+        write_only=True,
+    )
+    contact_info = serializers.CharField(
+        max_length=100,
+        required=False,
+        allow_blank=True,
+    )
 
     class Meta:
         model = User
-        fields = ['username', 'email', 'password', 'password2', 'role', 'contact_info']
+        fields = ["username", "email", "password", "password2", "role", "contact_info"]
 
     def validate(self, data):
-        if data['password'] != data['password2']:
+        if data["password"] != data["password2"]:
             raise serializers.ValidationError({"password": "Passwords do not match."})
         return data
 
     def create(self, validated_data):
-        role = validated_data.pop('role')
-        contact_info = validated_data.pop('contact_info', '')
-        password = validated_data.pop('password')
-        validated_data.pop('password2')
+        role = validated_data.pop("role")
+        contact_info = validated_data.pop("contact_info", "")
+        password = validated_data.pop("password")
+        validated_data.pop("password2")
 
-        user = User.objects.create_user(**validated_data)
-        user.set_password(password)
-        user.save()
-
+        user = User.objects.create_user(password=password, **validated_data)
         UserProfile.objects.create(
             user=user,
             role=role,
-            contact_info=contact_info
+            contact_info=contact_info,
         )
-
         return user
 
 
-# ────────────────────────────────────────────────
-# Login Serializer (used only for documentation / validation)
-# ────────────────────────────────────────────────
 class LoginSerializer(serializers.Serializer):
     username = serializers.CharField()
-    password = serializers.CharField(style={'input_type': 'password'})
+    password = serializers.CharField(style={"input_type": "password"})
 
     def validate(self, data):
         user = authenticate(**data)
@@ -55,21 +55,39 @@ class LoginSerializer(serializers.Serializer):
         raise serializers.ValidationError("Invalid username or password.")
 
 
-from .models import Product
+class OwnerSummarySerializer(serializers.Serializer):
+    id = serializers.IntegerField(source="user.id", read_only=True)
+    username = serializers.CharField(source="user.username", read_only=True)
+    role = serializers.CharField(read_only=True)
 
 
-class ProductCreateSerializer(serializers.ModelSerializer):
+class CustomerSummarySerializer(serializers.Serializer):
+    id = serializers.IntegerField(source="user.id", read_only=True)
+    username = serializers.CharField(source="user.username", read_only=True)
+    contact_info = serializers.CharField(read_only=True)
+
+
+class ProductSerializer(serializers.ModelSerializer):
+    owner = OwnerSummarySerializer(read_only=True)
+
     class Meta:
         model = Product
         fields = [
-            'name',
-            'description',
-            'price',
-            'stock_quantity',
-            'barcode',
-            'sku',
-            'image',
+            "id",
+            "owner",
+            "name",
+            "slug",
+            "description",
+            "price",
+            "stock_quantity",
+            "barcode",
+            "sku",
+            "image",
+            "is_available",
+            "created_at",
+            "updated_at",
         ]
+        read_only_fields = ["owner", "slug", "created_at", "updated_at"]
 
     def validate_price(self, value):
         if value <= 0:
@@ -82,134 +100,129 @@ class ProductCreateSerializer(serializers.ModelSerializer):
         return value
 
 
-from .models import CartItem
-from .models import Cart
-# core/serializers.py
-# core/serializers.py (update or add)
-from rest_framework import serializers
-from .models import Product
-
-class ProductSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Product
-        fields = [
-            'id',
-            'name',
-            'description',
-            'price',
-            'stock_quantity',
-            'barcode',
-            'sku',
-            'image',
-            'is_available',
-            'created_at',
-            'updated_at',
-        ]
-        read_only_fields = ['owner', 'created_at', 'updated_at']  # owner is set automatically
-
-
-
 class CartItemSerializer(serializers.ModelSerializer):
     product = ProductSerializer(read_only=True)
     product_id = serializers.PrimaryKeyRelatedField(
-        queryset=Product.objects.all(), source='product', write_only=True
+        queryset=Product.objects.filter(is_available=True, stock_quantity__gt=0),
+        source="product",
+        write_only=True,
+    )
+    subtotal = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        read_only=True,
     )
 
     class Meta:
         model = CartItem
-        fields = ['id', 'product', 'product_id', 'quantity', 'subtotal', 'added_at']
+        fields = ["id", "product", "product_id", "quantity", "subtotal", "added_at"]
+
+    def validate_quantity(self, value):
+        if value < 1:
+            raise serializers.ValidationError("Quantity must be at least 1.")
+        return value
 
 
 class CartSerializer(serializers.ModelSerializer):
     items = CartItemSerializer(many=True, read_only=True)
-    total_items = serializers.IntegerField(read_only=True)
-    total_price = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True, min_value=Decimal('0.00'))
+    total_items = serializers.SerializerMethodField()
+    total_price = serializers.SerializerMethodField()
 
     class Meta:
         model = Cart
-        fields = ['id', 'items', 'total_items', 'total_price', 'created_at', 'updated_at']
+        fields = ["id", "items", "total_items", "total_price", "created_at", "updated_at"]
 
+    def get_total_items(self, obj):
+        return sum(item.quantity for item in obj.items.all())
 
+    def get_total_price(self, obj):
+        total = sum(item.subtotal for item in obj.items.select_related("product"))
+        return f"{Decimal(total):.2f}"
 
- # serializers.py
-
-from rest_framework import serializers
-from .models import OrderItem, Order, Product
 
 class OrderItemSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(
-        source='product.name', 
+        source="product.name",
         read_only=True,
-        default='Product (removed)'
+        default="Product (removed)",
     )
-    
     product_image = serializers.SerializerMethodField()
+    subtotal = serializers.SerializerMethodField()
 
     class Meta:
         model = OrderItem
         fields = [
-            'id',                    # ← important: include id for React keys
-            'product_name',
-            'product_image',
-            'quantity',
-            'price_at_purchase'
+            "id",
+            "product_name",
+            "product_image",
+            "quantity",
+            "price_at_purchase",
+            "subtotal",
         ]
 
     def get_product_image(self, obj):
-        """
-        Safely return the full image URL or None
-        """
         if obj.product and obj.product.image:
-            # This gives http://127.0.0.1:8000/media/... in development
+            request = self.context.get("request")
+            if request is not None:
+                return request.build_absolute_uri(obj.product.image.url)
             return obj.product.image.url
         return None
 
+    def get_subtotal(self, obj):
+        return f"{obj.subtotal:.2f}"
+
 
 class OrderSerializer(serializers.ModelSerializer):
-    items = OrderItemSerializer(many=True, read_only=True)
+    items = serializers.SerializerMethodField()
+    total_amount = serializers.SerializerMethodField()
+    customer = CustomerSummarySerializer(read_only=True)
 
     class Meta:
         model = Order
         fields = [
-            'id',
-            'created_at',
-            'total_amount',
-            'status',
-            'is_paid',
-            'payment_reference',
-            'items'
+            "id",
+            "created_at",
+            "updated_at",
+            "customer",
+            "total_amount",
+            "status",
+            "is_paid",
+            "payment_reference",
+            "items",
         ]
 
-# core/serializers.py
+    def get_items(self, obj):
+        owner_profile = self.context.get("owner_profile")
+        items = obj.items.all()
+        if owner_profile is not None:
+            items = [item for item in items if item.product and item.product.owner_id == owner_profile.id]
 
-from rest_framework import serializers
-from decimal import Decimal
+        serializer = OrderItemSerializer(
+            items,
+            many=True,
+            context=self.context,
+        )
+        return serializer.data
+
+    def get_total_amount(self, obj):
+        owner_profile = self.context.get("owner_profile")
+        if owner_profile is None:
+            return f"{obj.total_amount:.2f}"
+
+        owner_total = sum(
+            item.subtotal
+            for item in obj.items.all()
+            if item.product and item.product.owner_id == owner_profile.id
+        )
+        return f"{owner_total:.2f}"
 
 
 class OwnerStatsSerializer(serializers.Serializer):
-    """
-    Serializer for owner dashboard statistics.
-    Returns aggregated data for the authenticated shop owner.
-    """
     total_sales = serializers.DecimalField(
         max_digits=12,
         decimal_places=2,
-        default=Decimal('0.00'),
-        help_text="Total sales amount from completed orders (KES)"
+        default=Decimal("0.00"),
     )
-    
-    total_orders = serializers.IntegerField(
-        default=0,
-        help_text="Number of completed orders containing the owner's products"
-    )
-    
-    low_stock_products = serializers.IntegerField(
-        default=0,
-        help_text="Number of products with stock quantity less than 10"
-    )
-    
-    total_products = serializers.IntegerField(
-        default=0,
-        help_text="Total number of products owned by this shop owner"
-    )
-
+    total_orders = serializers.IntegerField(default=0)
+    low_stock_products = serializers.IntegerField(default=0)
+    total_products = serializers.IntegerField(default=0)

@@ -60,13 +60,15 @@ class Product(models.Model):
     def save(self, *args, **kwargs):
         if not self.slug:
             self.slug = slugify(self.name)
+        self.is_available = self.stock_quantity > 0
         super().save(*args, **kwargs)
 
     def reduce_stock(self, quantity):
         if self.stock_quantity < quantity:
             raise ValueError(f"Not enough stock: {self.stock_quantity} available")
         self.stock_quantity -= quantity
-        self.save(update_fields=['stock_quantity'])
+        self.is_available = self.stock_quantity > 0
+        self.save(update_fields=['stock_quantity', 'is_available'])
 
 # core/models.py (add after Order/OrderItem)
 
@@ -133,6 +135,7 @@ class Order(models.Model):
         max_length=50,
         choices=[
             ('pending', 'Pending'),
+            ('approved', 'Approved'),
             ('completed', 'Completed'),
             ('cancelled', 'Cancelled')
         ],
